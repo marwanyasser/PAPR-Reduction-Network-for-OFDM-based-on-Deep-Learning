@@ -1,0 +1,252 @@
+from dataclasses import dataclass
+#from gettext import npgettext
+from mimetypes import init
+import tensorflow as tf
+from tensorflow import keras
+import keras.backend as KB
+import numpy as np
+import pandas as pd
+from keras.models import Sequential
+from keras.layers import Dense, Dropout, BatchNormalization, Activation, Input
+from tensorflow.python.client import device_lib
+import matplotlib.pyplot as plt
+from tensorflow.keras import regularizers
+from ModulationPy import QAMModem
+import time
+
+
+tf.compat.v1.enable_eager_execution()
+
+np.set_printoptions(threshold=np.inf)
+opt = keras.optimizers.Adam(learning_rate=0.001) #learning rate and adam
+N = 256
+L = 8
+step = int(N/L)
+Reserved_phases = [0, 32, 62, 93, 124, 155, 186, 217, 248]
+
+def PAPR_Loss(y_true, y_pred):
+    batchsize = y_true.shape[0]      
+    data = tf.concat([tf.concat([tf.complex(y_true[:, Reserved_phases[i]*2:Reserved_phases[i+1]*2:2], y_true[:, Reserved_phases[i]*2+1:Reserved_phases[i+1]*2:2]), tf.complex(y_pred[:, i*2], y_pred[:, i*2+1])[:, tf.newaxis]], 1) for i in range(L)], 1)
+    x3 = tf.square(tf.abs(tf.signal.ifft(data)))
+    loss = 10* tf.experimental.numpy.log10(tf.reduce_max(x3, axis=-1) / tf.reduce_mean(x3, axis = -1))
+    return tf.reduce_max(loss)
+
+
+def custom_tanh(x):
+    return (KB.tanh(x) * 5)
+
+def TR_ML():
+    TR = Sequential()
+
+# 5 layers , each layer is of FC, Batch, Dropout, Tanh
+    # Layer 1   Input Layer
+    input = Input(shape = ((N-L)*2,))
+    
+    #Layer 2    Hidden 1       Generally its best to use dense of size mean(input+output)
+    x = Dense((2048), activation='relu', activity_regularizer=regularizers.L2(1e-5))(input)
+    x = BatchNormalization() (x)
+    x = Dropout(0.3) (x)
+
+    x = Dense(2048, activation='relu', activity_regularizer=regularizers.L2(1e-5))(x)
+    x = BatchNormalization() (x)
+    x = Dropout(0.3) (x)
+
+    x = Dense(2048, activation='relu', activity_regularizer=regularizers.L2(1e-5))(x)
+    x = BatchNormalization() (x)
+    x = Dropout(0.3) (x)
+
+    #x = Dense(1024, activation='tanh', activity_regularizer=regularizers.L2(1e-5))(x)
+    #x = BatchNormalization() (x)
+    #x = Dropout(0.3) (x)
+
+
+    #x = Dense(512, activation='tanh', activity_regularizer=regularizers.L2(1e-5))(x)
+    #x = BatchNormalization() (x)
+    #x = Dropout(0.3) (x)
+    #Output
+    output = Dense(L*2, activation = custom_tanh)(x)
+
+    TR = tf.keras.Model(inputs=input, outputs=output)
+    return TR
+
+A = np.array([-1,1], dtype=float)
+dataset = np.random.choice(A, size = (150000,(N-L)*2))
+dataset = np.unique(dataset, axis=1)
+print(dataset.shape)
+trainX = dataset[:int(len(dataset)*0.6),:]
+ValidationX = dataset[int(len(dataset)*0.8):int(len(dataset)*0.9),:]
+testX = dataset[int(len(dataset)*0.9):,:]
+print(trainX.shape)
+model = TR_ML()
+model.compile(optimizer= opt, loss= PAPR_Loss, run_eagerly = True)
+callback = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=15)  #to stop learning whenever loss saturates 
+history = model.fit(trainX, trainX, epochs= 60, batch_size= 400, callbacks=[callback] ,validation_data=(ValidationX, ValidationX))
+
+#model.save(r'F:\Personal\college\GraduationProject\non_restricted.h5')
+
+results = model.evaluate(testX, testX, batch_size=400)
+print("test loss, test acc:", results)
+
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.title('model loss')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['train', 'test'], loc='upper left')
+plt.show()
+
+from numpy.core.fromnumeric import cumsum, mean
+from numpy.lib.type_check import real
+from numpy.fft import fft, ifft
+
+
+def Modulation(random_Data, N, o):   #62
+    data_non_modulated = random_Data
+    data = np.zeros((N,o),dtype=complex)
+    modem = QAMModem(4,                  #QPSK modulation
+                 gray_map=True, 
+                 bin_input=True)
+    for i in range(o):
+        data[:,i] = modem.modulate(data_non_modulated[:,i])
+    return data
+
+
+def IFFT (data, o): 
+    ifft_data = np.zeros((N,o), dtype= complex)
+    for i in range(o):
+        ifft_data[:,i] = np.fft.ifft(data[:,i], N)
+    return(ifft_data)
+
+def IFFT_Symbol (data):  
+    temp = np.fft.ifft(data, N)
+    return(temp)
+
+
+def PAPR_of_Data(data, o):
+    PAPR = np.zeros(o, dtype=complex)
+    for i in range(o):
+        PAPR[i] = np.max(data[:,i]*np.conj(data[:,i])) / np.mean(data[:,i]*np.conj(data[:,i]))
+    PAPR_db = 10*np.log10(PAPR)
+    #print(max(PAPR_db))
+    return PAPR_db
+  
+def PAPR_of_Symbol(symbol):
+    PAPR = np.max(symbol*np.conj(symbol)) / np.mean(symbol*np.conj(symbol))
+    PAPR_db = 10*np.log10(PAPR)
+    return PAPR_db
+
+def PAPR_Loss(y_true, y_pred):
+    Reserved_phases = [0, 32, 62, 93, 124, 155, 186, 217, 248]
+    batchsize = y_true.shape[0]      
+    data = tf.concat([tf.concat([tf.complex(y_true[:, Reserved_phases[i]*2:Reserved_phases[i+1]*2:2], y_true[:, Reserved_phases[i]*2+1:Reserved_phases[i+1]*2:2]), tf.complex(y_pred[:, i*2], y_pred[:, i*2+1])[:, tf.newaxis]], 1) for i in range(L)], 1)
+    x3 = tf.square(tf.abs(tf.signal.ifft(data)))
+    loss = 10* tf.experimental.numpy.log10(tf.reduce_max(x3, axis=-1) / tf.reduce_mean(x3, axis = -1))
+    return loss
+
+def custom_tanh(x):
+    return (KB.tanh(x) * 5)
+
+def RP_Simulation(data, N, o, step):   #we send data before modulation
+    Reserved_phases = np.array([32, 63, 95, 127, 159, 191, 223, 255])
+    data_time_slots = np.zeros((N, o), dtype=complex)
+    data_imag = np.zeros((N,o), dtype=complex)
+    data_real = np.zeros((N,o), dtype=complex)
+    
+    data_split = np.zeros((N*2,o), dtype=complex)
+    
+    for i in range(o):
+        for x in Reserved_phases:
+            data[x, i] = 0
+        data_time_slots[:, i] = ifft(data[:, i], N)
+    PAPR_noTR = PAPR_of_Data(data_time_slots, o)
+    #print('data is',data)
+    
+    for j in range(N):
+        for i in range(o):
+            data_imag[j,i] = np.imag(data[j,i])
+            data_real[j,i] = np.real(data[j,i])
+    
+    for j in range(N*2):
+        for i in range(o):
+            if j%2 == 0:    
+                data_split[j,i] = data_real[int(j/2),i]
+            else:
+                data_split[j,i] = data_imag[int((j-1)/2),i]
+                
+    #print(data_split)
+    
+    data_no_zeros = data_split[~np.all(data_split == 0, axis=1)]
+    #print('noZeroes',data_no_zeros)
+    print('noZeroes shape',data_no_zeros.shape)
+    print('Power of original data')
+    print(tf.reduce_mean(tf.square(tf.abs(data_no_zeros))))
+                
+
+                           
+    
+    #split real and imag:
+    
+    TRNet = keras.models.load_model(r'/content/drive/My Drive/TRnettanh5.h5', custom_objects= {'PAPR_Loss': PAPR_Loss, 'custom_tanh':custom_tanh})
+    TRNet_output = TRNet.predict(np.transpose(data_no_zeros)) #get C of data frequency slots
+    print('Reduction Vector is')
+    print(TRNet_output)
+    print('max reserved tone value is:')
+    print(np.amax(TRNet_output))
+    print(TRNet_output.shape)
+    for j in range(o):
+        counter = 0
+        for i in Reserved_phases:
+                data[i, j] = TRNet_output[j, counter] + 1j * TRNet_output[j, counter+1]
+                counter += 2
+    #print(data)
+    for i in range(o):
+        data_time_slots[:, i] = ifft(data[:, i], N)
+
+    print('Signal Power after TR')
+    print(tf.reduce_mean(tf.square(tf.abs(data_time_slots))))
+
+    PAPR_TRnet = PAPR_of_Data(data_time_slots, o)
+    return PAPR_noTR, PAPR_TRnet
+
+def CCDF_Plotter(PAPR_TRnet, PAPR_noTR):
+    x, n = np.histogram(PAPR_noTR, bins= 100)
+    x2, n2 = np.histogram(PAPR_TRnet, bins = 100)
+    plt.plot(n[1:], 1 - np.cumsum(x)/o, 'k', label = 'Normal OFDM')
+    plt.plot(n2[1:], 1 - np.cumsum(x2)/o, 'r', label = 'Tone Reservation Predicted')
+
+N = 256  #SUBCARRIERS
+o = 10000  #Number of Symbols
+#U = {2, 4, 16, 32, 512}
+
+#M = (N-2) / 2 
+#M = int(M)
+noBitsPerSymbol = 2       #MODULATION DEPENDANT 
+#print(M)
+K = N*noBitsPerSymbol     # size for modulation 
+# GENERATE DATA
+random_Data = np.random.randint(2, size=(K, o)) 
+#REAL DATA
+Modulated_Data = Modulation(random_Data,N ,o)
+print(Modulated_Data)
+print('power of signal before TR')
+print(np.mean(np.square(np.abs(Modulated_Data))))
+L = 8 #Number of Reserved tones
+step = int(N/L)
+t = time.process_time()
+PAPR_noTR, PAPR_TRnet = RP_Simulation(Modulated_Data, N, o, step)
+print('Power before TR')
+print(tf.reduce_mean(tf.square(tf.abs(PAPR_noTR))))   
+print('Power after TR')
+print(tf.reduce_mean(tf.square(tf.abs(PAPR_TRnet))))
+
+fig = plt.figure()
+plt.xlabel('PAPR in db')
+plt.title("OFDM PAPR Simulation at N= "+ str(N) + " L = "+ str(L))
+plt.yscale('log')
+#plt.ylim(10e-5, 1.2)
+plt.grid(True, which="both")
+CCDF_Plotter(PAPR_TRnet, PAPR_noTR)
+#plt.legend(loc='upper right', fontsize='small')
+s = 'time is ' + repr((time.process_time() - t)/60) + ' minutes'
+print(s)
+plt.show()
